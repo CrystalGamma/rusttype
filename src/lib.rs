@@ -130,19 +130,100 @@ fn scan_table_records(data: &[u8], start: usize, label: u32, num_tables: usize) 
 	None
 }
 
-fn load_font_cmap(data: &[u8]) -> Option<Font> {
-	Some(Font(data))
+fn find_best_cmap(cmap: &[u8]) -> Option<&[u8]> {
+	let mut bmp = None;
+	for encoding in 0..read_u16(&cmap[2..]).unwrap() as usize {
+		let enc_header = &(&cmap[4+8*encoding..])[..8];
+		let (plat, enc) = (read_u16(enc_header).unwrap(), read_u16(&enc_header[2..]).unwrap());
+		println!("{}:{}", plat, enc);
+		match (plat, enc) {
+			(0, 3) | (3, 1) => {bmp=Some(&cmap[try_opt!(read_u32(&enc_header[4..])) as usize..]);},
+			(0, 4) | (3, 10) => return Some(&cmap[try_opt!(read_u32(&enc_header[4..])) as usize..]),
+			_ => {}	// unknown encoding
+		}
+	}
+	bmp
 }
 
-pub fn load_font_collection<'a>(data: &'a[u8], fonts: Vec<&str>) -> Option<(FontCollection<'a>, Vec<Font<'a>>)> {
+enum Encoding<'a> {
+	Fmt4 {
+		end: &'a[u8],
+		start: &'a[u8],
+		delta: &'a[u8],
+		crazy_indexing_part: &'a[u8]
+	}
+}
+
+impl<'a> Encoding<'a> {
+	fn lookup(&self, c: char) -> Option<u16> {
+		match *self {
+			Encoding::Fmt4 {end, start, delta, crazy_indexing_part: range_offset} => {
+				if c as u32 > 0xffff {return Some(0)}
+				let mut range = 0..end.len()/2;
+				while range.start != range.end {
+					let pivot = ((range.end - range.start) & !1) + range.start*2;
+					range = if read_u16(&end[pivot..]).unwrap() > c as u16 {
+						pivot/2+1..range.end
+					} else {
+						range.start..pivot/2+1
+					};
+				}
+				let seg_offset = range.start*2;
+				let block_start = read_u16(&start[seg_offset..]).unwrap();
+				if block_start < c as u16 {return Some(0)}
+				let block_index = c as u16 - block_start;
+				return Some((read_u16(&delta[seg_offset..]).unwrap()) + {
+					let offset = read_u16(&range_offset[seg_offset..]).unwrap();
+					if offset == 0 {
+						block_index
+					} else {	// this path is untested because the spec is really weird and I've never seen it used
+						let res = read_u16(&range_offset[seg_offset+(offset as usize &!1)+block_index as usize..]).unwrap();
+						if res == 0 {
+							return Some(0)
+						} else {
+							res
+						}
+					}
+				})
+			}
+		}
+	}
+}
+
+fn load_enc_table(mut enc: &[u8]) -> Option<Encoding> {
+	let format = try_opt!(read_u16(enc));
+	println!("Format{}", format);
+	match format {
+		4 => {
+			let len = try_opt!(read_u16(&enc[2..])) as usize;
+			if len > enc.len() {return None}
+			enc = &enc[..len];
+			let segsX2 = try_opt!(read_u16(&enc[6..])) as usize;
+			if segsX2 < 2 || segsX2 % 2 != 0 || 4*segsX2 + 16 < len {return None}
+			let end = &enc[14..14+segsX2];
+			if read_u16(&end[segsX2-2..]).unwrap() != 0xffff {return None}
+			Some(Encoding::Fmt4 {
+				end: end,
+				start: &enc[16+segsX2..16+2*segsX2],
+				delta: &enc[16+2*segsX2..16+3*segsX2],
+				crazy_indexing_part: &enc[16+3*segsX2..]
+			})
+		},
+		_ => None	// not implemented
+	}
+}
+
+pub fn load_font<'a>(data: &'a[u8], font: &str) -> Option<Font<'a>> {
 	let num_tables = try_opt!(read_u16(&data[4..])) as usize;
 	let (_pos, cmap) = try_opt!(scan_table_records(data, 0, 0x636d6170, num_tables));
-	Some((FontCollection(data), vec![Font(cmap)]))
+	let best_enc = try_opt!(find_best_cmap(cmap));
+	let enc = try_opt!(load_enc_table(best_enc));
+	Some(Font(best_enc))
 }
 
 struct GlyphIndex(u16);
 
-struct Burst<'a, 'b: 'a>(Vec<GlyphIndex>, &'a FontCollection<'b>, StreakTypesetting);
+struct Burst<'a, 'b: 'a>(Vec<GlyphIndex>, &'a Font<'b>, StreakTypesetting);
 
 pub struct TypeSetting<'a, 'b: 'a>(Vec<Burst<'a, 'b>>);
 
