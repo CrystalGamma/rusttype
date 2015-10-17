@@ -83,7 +83,7 @@ pub struct FontCollection<'a>(&'a[u8]);
 pub struct FontConfiguration;
 
 /// contains character mapping
-pub struct Font<'a>(&'a[u8]);
+pub struct Font<'a>(pub Encoding<'a>, &'a FontCollection<'a>);
 
 struct GlyphPoint(i16, i16);
 enum ContourSegment {
@@ -146,19 +146,18 @@ fn find_best_cmap(cmap: &[u8]) -> Option<&[u8]> {
 }
 
 enum Encoding<'a> {
-	Fmt4 {
-		end: &'a[u8],
-		start: &'a[u8],
-		delta: &'a[u8],
-		crazy_indexing_part: &'a[u8]
-	}
+	Fmt4(CmapFmt4<'a>)
+}
+
+trait Cmap {
+	fn lookup<'a>(&self, &'a str) -> (Vec<GlyphIndex>, &'a str);
 }
 
 impl<'a> Encoding<'a> {
-	fn lookup(&self, c: char) -> Option<u16> {
+	pub fn lookup(&self, c: char) -> Option<GlyphIndex> {
 		match *self {
-			Encoding::Fmt4 {end, start, delta, crazy_indexing_part: range_offset} => {
-				if c as u32 > 0xffff {return Some(0)}
+			Encoding::Fmt4 (CmapFmt4 {end, start, delta, crazy_indexing_part: range_offset}) => {
+				if c as u32 > 0xffff {return Some(GlyphIndex(0))}
 				let mut range = 0..end.len()/2;
 				while range.start != range.end {
 					let pivot = ((range.end - range.start) & !1) + range.start*2;
@@ -170,24 +169,31 @@ impl<'a> Encoding<'a> {
 				}
 				let seg_offset = range.start*2;
 				let block_start = read_u16(&start[seg_offset..]).unwrap();
-				if block_start < c as u16 {return Some(0)}
+				if block_start < c as u16 {return Some(GlyphIndex(0))}
 				let block_index = c as u16 - block_start;
-				return Some((read_u16(&delta[seg_offset..]).unwrap()) + {
+				return Some(GlyphIndex((read_u16(&delta[seg_offset..]).unwrap()).wrapping_add({
 					let offset = read_u16(&range_offset[seg_offset..]).unwrap();
 					if offset == 0 {
 						block_index
 					} else {	// this path is untested because the spec is really weird and I've never seen it used
 						let res = read_u16(&range_offset[seg_offset+(offset as usize &!1)+block_index as usize..]).unwrap();
 						if res == 0 {
-							return Some(0)
+							return Some(GlyphIndex(0))
 						} else {
 							res
 						}
 					}
-				})
+				})))
 			}
 		}
 	}
+}
+
+struct CmapFmt4<'a> {
+	end: &'a[u8],
+	start: &'a[u8],
+	delta: &'a[u8],
+	crazy_indexing_part: &'a[u8]
 }
 
 fn load_enc_table(mut enc: &[u8]) -> Option<Encoding> {
@@ -202,26 +208,32 @@ fn load_enc_table(mut enc: &[u8]) -> Option<Encoding> {
 			if segsX2 < 2 || segsX2 % 2 != 0 || 4*segsX2 + 16 < len {return None}
 			let end = &enc[14..14+segsX2];
 			if read_u16(&end[segsX2-2..]).unwrap() != 0xffff {return None}
-			Some(Encoding::Fmt4 {
+			Some(Encoding::Fmt4(CmapFmt4{
 				end: end,
 				start: &enc[16+segsX2..16+2*segsX2],
 				delta: &enc[16+2*segsX2..16+3*segsX2],
 				crazy_indexing_part: &enc[16+3*segsX2..]
-			})
+			}))
 		},
 		_ => None	// not implemented
 	}
 }
 
-pub fn load_font<'a>(data: &'a[u8], font: &str) -> Option<Font<'a>> {
+pub fn load_font_collection(data: &[u8]) -> Option<FontCollection> {
+	Some(FontCollection(data))
+}
+
+pub fn load_font<'a>(collection: &'a FontCollection<'a>, font: &str) -> Option<Font<'a>> {
+	let data = collection.0;
 	let num_tables = try_opt!(read_u16(&data[4..])) as usize;
 	let (_pos, cmap) = try_opt!(scan_table_records(data, 0, 0x636d6170, num_tables));
 	let best_enc = try_opt!(find_best_cmap(cmap));
 	let enc = try_opt!(load_enc_table(best_enc));
-	Some(Font(best_enc))
+	Some(Font(enc, collection))
 }
 
-struct GlyphIndex(u16);
+#[derive(Debug)]
+pub struct GlyphIndex(u16);
 
 struct Burst<'a, 'b: 'a>(Vec<GlyphIndex>, &'a Font<'b>, StreakTypesetting);
 
