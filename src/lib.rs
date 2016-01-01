@@ -83,7 +83,7 @@ pub struct FontCollection<'a>(&'a[u8]);
 pub struct FontConfiguration;
 
 /// contains character mapping
-pub struct Font<'a>(pub Encoding<'a>, &'a FontCollection<'a>);
+pub struct Font<'a>(Encoding<'a>, &'a FontCollection<'a>);
 
 struct GlyphPoint(i16, i16);
 enum ContourSegment {
