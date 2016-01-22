@@ -80,11 +80,13 @@ pub fn bidi_algorithm(streaks: &mut [Item]) {}
 pub struct FontPreference<'a>(Font<'a>);
 
 /// contains glyphs and typesetting information
+#[derive(PartialEq, Clone, Copy)]
 pub struct FontCollection<'a>(&'a[u8]);
 /// what features of the font collection do we want to use?
 pub struct FontConfiguration;
 
 /// contains character mapping
+#[derive(PartialEq, Clone, Copy)]
 pub struct Font<'a>{
 	pub cmap: CMap<'a>,
 	glyph_src: &'a FontCollection<'a>
@@ -149,10 +151,12 @@ fn find_best_cmap(cmap: &[u8]) -> Option<&[u8]> {
 	bmp
 }
 
+#[derive(PartialEq, Clone, Copy)]
 pub struct CMap<'otf>(Encoding<'otf>);
 
 impl<'otf> CMap<'otf> {pub fn lookup(&self, c: char) -> Option<GlyphIndex> {self.0.lookup(c)}}
 
+#[derive(PartialEq, Clone, Copy)]
 enum Encoding<'a> {
 	Fmt4(CmapFmt4<'a>)
 }
@@ -194,6 +198,7 @@ impl<'a> Encoding<'a> {
 	}
 }
 
+#[derive(PartialEq, Clone, Copy)]
 struct CmapFmt4<'a> {
 	end: &'a[u8],
 	start: &'a[u8],
@@ -227,19 +232,21 @@ pub fn load_font_collection(data: &[u8]) -> Option<FontCollection> {
 	Some(FontCollection(data))
 }
 
+static CMAP_TAG: u32 = 0x636d6170;
+
 pub fn load_font<'a>(collection: &'a FontCollection<'a>, font: &str) -> Option<Font<'a>> {
 	let data = collection.0;
 	let num_tables = try_opt!(read_u16(&data[4..])) as usize;
-	let (_pos, cmap) = try_opt!(scan_table_records(data, 0, 0x636d6170, num_tables));
+	let (_pos, cmap) = try_opt!(scan_table_records(data, 0, CMAP_TAG, num_tables));
 	let best_enc = try_opt!(find_best_cmap(cmap));
 	let enc = try_opt!(load_enc_table(best_enc));
 	Some(Font {cmap: CMap(enc), glyph_src: collection})
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct GlyphIndex(u16);
 
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy)]
 pub struct GlyphMap<'text> {
 	pub range: &'text str,
 	pub dir: Direction,
@@ -247,14 +254,14 @@ pub struct GlyphMap<'text> {
 	pub span: u16	// between which caret positions of a ligature?
 }
 
-pub struct Burst<'text, 'a, 'b: 'a> {
+pub struct Burst<'text, 'a> {
 	pub glyphs: Vec<GlyphIndex>,
-	pub font: &'a Font<'b>,
+	pub font: &'a FontCollection<'a>,
 	pub dir: ItemTypesetting,
 	pub glyph_map: Vec<GlyphMap<'text>>
 }
 
-pub fn shape<'text, 'a, 'b: 'a>(item: Item<'text>, font: &'a Font<'b>) -> Option<Burst<'text, 'a, 'b>> {
+pub fn shape<'text, 'a, 'b: 'a>(item: Item<'text>, font: &'a Font<'b>) -> Option<Burst<'text, 'b>> {
 	let (mut glyphs, mut glyph_map) = (Vec::with_capacity(item.text.len()), Vec::with_capacity(item.text.len()));	// 1 char ⇒ 1 glyph (at this stage) is at least one byte long
 	let mut rest = item.text;
 	while rest.len() > 0 {
@@ -270,5 +277,41 @@ pub fn shape<'text, 'a, 'b: 'a>(item: Item<'text>, font: &'a Font<'b>) -> Option
 		});
 		rest = &rest[size..];
 	}
-	Some(Burst {glyphs: glyphs, glyph_map: glyph_map, font: font, dir: item.dir})
+	Some(Burst {glyphs: glyphs, glyph_map: glyph_map, font: font.glyph_src, dir: item.dir})
+}
+
+pub fn merge_bursts<'text, 'a, I: IntoIterator<Item=Burst<'text, 'a>>>(bursts: I) -> Vec<Burst<'text, 'a>> {
+	let iter = bursts.into_iter();
+	let mut res: Vec<Burst> = Vec::with_capacity(iter.size_hint().0);
+	for mut burst in iter {
+		if let Some(last) = res.last_mut() {
+			if burst.dir == last.dir && *burst.font == *last.font {
+				if burst.dir.effective_direction() == Forward {
+					last.glyphs.extend_from_slice(&burst.glyphs);
+					last.glyph_map.extend_from_slice(&burst.glyph_map);
+				} else {
+					burst.glyphs.extend_from_slice(&last.glyphs);
+					last.glyphs = burst.glyphs;
+					burst.glyph_map.extend_from_slice(&last.glyph_map);
+					last.glyph_map = burst.glyph_map;
+				}
+				continue
+			}
+		}
+		res.push(burst);
+	}
+	res
+}
+
+#[test]
+fn test_burst_merge() {
+	let fc = FontCollection(&[]);
+	let res = merge_bursts(vec![
+		Burst {glyphs: Vec::new(), font: &fc, dir: ItemTypesetting(DirBehavior(Forward, Perpendicular), Rot180::Rotated), glyph_map: Vec::new()},
+		Burst {glyphs: vec![GlyphIndex(2)], font: &fc, dir: ItemTypesetting(DirBehavior(Reverse, Perpendicular), Rot180::Normal), glyph_map: Vec::new()},
+		Burst {glyphs: vec![GlyphIndex(1)], font: &fc, dir: ItemTypesetting(DirBehavior(Reverse, Perpendicular), Rot180::Normal), glyph_map: Vec::new()},
+		Burst {glyphs: Vec::new(), font: &fc, dir: ItemTypesetting(DirBehavior(Forward, Perpendicular), Rot180::Normal), glyph_map: Vec::new()}
+	]);
+	assert_eq!(res.len(), 3);
+	assert_eq!(res[1].glyphs, vec![GlyphIndex(1), GlyphIndex(2)]);
 }
