@@ -12,18 +12,18 @@ impl Direction {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum GlyphOrient {Perpendicular, Parallel}
+pub enum GlyphOrient {Perpendicular, Parallel}
 use self::GlyphOrient::*;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct DirBehavior(Direction, GlyphOrient);
+pub struct DirBehavior(pub Direction, pub GlyphOrient);
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum DirPreference {Horiz(DirBehavior), Vert(DirBehavior), BiOrient(DirBehavior, DirBehavior)}	// enable scripts without preference?
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Rot180 {Normal, Rotated}
+pub enum Rot180 {Normal, Rotated}
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct StreakTypesetting(DirBehavior, Rot180);
+pub struct ItemTypesetting(pub DirBehavior, pub Rot180);
 
-impl StreakTypesetting {
+impl ItemTypesetting {
 	fn effective_direction(&self) -> Direction {
 		match self.1 {
 			Rot180::Normal => self.0 . 0,
@@ -45,37 +45,39 @@ pub struct NonNativeConf;
 
 pub struct Run<'a>(pub &'a str, pub ScriptCode);
 
-pub fn make_default_streak<'a>(run: &'a Run, main_axis: MainAxis) -> Streak<'a> {
+pub fn make_default_streak<'a>(run: &'a Run, main_axis: MainAxis) -> Item<'a> {
 	use self::MainAxis::*;
-	Streak(run.0, run.1, StreakTypesetting(DirBehavior(Forward, Perpendicular), if run.1 == LATIN {
-		match main_axis {
-			Ltr | Ttb => Rot180::Normal,
-			Rtl | Btt => Rot180::Rotated
-		}
-	} else {
-		unimplemented!();
-	}))
+	Item {
+		text: run.0,
+		script: run.1,
+		dir: ItemTypesetting(DirBehavior(Forward, Perpendicular), if run.1 == LATIN {
+			match main_axis {
+				Ltr | Ttb => Rot180::Normal,
+				Rtl | Btt => Rot180::Rotated
+			}
+		} else {
+			unimplemented!();
+		})
+	}
 }
 
 pub fn make_runs(s: &str) -> Vec<Run> {vec![Run(s, LATIN)]}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Streak<'a>(&'a str, ScriptCode, StreakTypesetting);
-
-impl<'a> Streak<'a> {
-	/// what order do the parts have if you split the streak
-	pub fn direction(&self) -> Direction {self.2.effective_direction()}
+pub struct Item<'text>{
+	pub text: &'text str,
+	pub script: ScriptCode,
+	pub dir: ItemTypesetting
 }
 
-pub fn bidi_algorithm(streaks: &mut [Streak]) {}
+impl<'a> Item<'a> {
+	/// what order do the parts have if you split the streak
+	pub fn direction(&self) -> Direction {self.dir.effective_direction()}
+}
+
+pub fn bidi_algorithm(streaks: &mut [Item]) {}
 
 pub struct FontPreference<'a>(Font<'a>);
-
-/*impl FontPreference {
-	fn lookup(&self) -> Vec<Burst> {
-		Vec::new()
-	}
-}*/
 
 /// contains glyphs and typesetting information
 pub struct FontCollection<'a>(&'a[u8]);
@@ -83,7 +85,10 @@ pub struct FontCollection<'a>(&'a[u8]);
 pub struct FontConfiguration;
 
 /// contains character mapping
-pub struct Font<'a>(Encoding<'a>, &'a FontCollection<'a>);
+pub struct Font<'a>{
+	pub cmap: CMap<'a>,
+	glyph_src: &'a FontCollection<'a>
+}
 
 struct GlyphPoint(i16, i16);
 enum ContourSegment {
@@ -135,7 +140,6 @@ fn find_best_cmap(cmap: &[u8]) -> Option<&[u8]> {
 	for encoding in 0..read_u16(&cmap[2..]).unwrap() as usize {
 		let enc_header = &(&cmap[4+8*encoding..])[..8];
 		let (plat, enc) = (read_u16(enc_header).unwrap(), read_u16(&enc_header[2..]).unwrap());
-		println!("{}:{}", plat, enc);
 		match (plat, enc) {
 			(0, 3) | (3, 1) => {bmp=Some(&cmap[try_opt!(read_u32(&enc_header[4..])) as usize..]);},
 			(0, 4) | (3, 10) => return Some(&cmap[try_opt!(read_u32(&enc_header[4..])) as usize..]),
@@ -145,12 +149,12 @@ fn find_best_cmap(cmap: &[u8]) -> Option<&[u8]> {
 	bmp
 }
 
+pub struct CMap<'otf>(Encoding<'otf>);
+
+impl<'otf> CMap<'otf> {pub fn lookup(&self, c: char) -> Option<GlyphIndex> {self.0.lookup(c)}}
+
 enum Encoding<'a> {
 	Fmt4(CmapFmt4<'a>)
-}
-
-trait Cmap {
-	fn lookup<'a>(&self, &'a str) -> (Vec<GlyphIndex>, &'a str);
 }
 
 impl<'a> Encoding<'a> {
@@ -161,15 +165,16 @@ impl<'a> Encoding<'a> {
 				let mut range = 0..end.len()/2;
 				while range.start != range.end {
 					let pivot = ((range.end - range.start) & !1) + range.start*2;
-					range = if read_u16(&end[pivot..]).unwrap() > c as u16 {
+					let pivot_val = read_u16(&end[pivot..]).unwrap();
+					range = if pivot_val < c as u16 {
 						pivot/2+1..range.end
 					} else {
-						range.start..pivot/2+1
+						range.start..pivot/2
 					};
 				}
 				let seg_offset = range.start*2;
 				let block_start = read_u16(&start[seg_offset..]).unwrap();
-				if block_start < c as u16 {return Some(GlyphIndex(0))}
+				if block_start > c as u16 {return Some(GlyphIndex(0))}
 				let block_index = c as u16 - block_start;
 				return Some(GlyphIndex((read_u16(&delta[seg_offset..]).unwrap()).wrapping_add({
 					let offset = read_u16(&range_offset[seg_offset..]).unwrap();
@@ -198,7 +203,6 @@ struct CmapFmt4<'a> {
 
 fn load_enc_table(mut enc: &[u8]) -> Option<Encoding> {
 	let format = try_opt!(read_u16(enc));
-	println!("Format{}", format);
 	match format {
 		4 => {
 			let len = try_opt!(read_u16(&enc[2..])) as usize;
@@ -229,16 +233,42 @@ pub fn load_font<'a>(collection: &'a FontCollection<'a>, font: &str) -> Option<F
 	let (_pos, cmap) = try_opt!(scan_table_records(data, 0, 0x636d6170, num_tables));
 	let best_enc = try_opt!(find_best_cmap(cmap));
 	let enc = try_opt!(load_enc_table(best_enc));
-	Some(Font(enc, collection))
+	Some(Font {cmap: CMap(enc), glyph_src: collection})
 }
 
 #[derive(Debug)]
 pub struct GlyphIndex(u16);
 
-struct Burst<'a, 'b: 'a>(Vec<GlyphIndex>, &'a Font<'b>, StreakTypesetting);
+#[derive(Debug)]
+pub struct GlyphMap<'text> {
+	pub range: &'text str,
+	pub dir: Direction,
+	pub glyph_off: usize,
+	pub span: u16	// between which caret positions of a ligature?
+}
 
-pub struct TypeSetting<'a, 'b: 'a>(Vec<Burst<'a, 'b>>);
+pub struct Burst<'text, 'a, 'b: 'a> {
+	pub glyphs: Vec<GlyphIndex>,
+	pub font: &'a Font<'b>,
+	pub dir: ItemTypesetting,
+	pub glyph_map: Vec<GlyphMap<'text>>
+}
 
-fn typeset<'a, 'b>(streak: Streak, fonts: &FontPreference<'a>) -> TypeSetting<'b, 'a> {
-	TypeSetting(Vec::new())
+pub fn shape<'text, 'a, 'b: 'a>(item: Item<'text>, font: &'a Font<'b>) -> Option<Burst<'text, 'a, 'b>> {
+	let (mut glyphs, mut glyph_map) = (Vec::with_capacity(item.text.len()), Vec::with_capacity(item.text.len()));	// 1 char ⇒ 1 glyph (at this stage) is at least one byte long
+	let mut rest = item.text;
+	while rest.len() > 0 {
+		let c = rest.chars().next().unwrap();
+		let idx = try_opt!(font.cmap.lookup(c));
+		glyphs.push(idx);
+		let size = c.len_utf8();
+		glyph_map.push(GlyphMap {
+			range: &rest[..size],
+			dir: Forward,
+			glyph_off: glyphs.len() - 1,
+			span: 0
+		});
+		rest = &rest[size..];
+	}
+	Some(Burst {glyphs: glyphs, glyph_map: glyph_map, font: font, dir: item.dir})
 }

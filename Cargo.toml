@@ -2,6 +2,3 @@
 name = "rusttype"
 version = "0.1.0"
 authors = ["Jona Stubbe (CrystalGamma) <dev@jona-stubbe.de>"]
-
-[dependencies]
-wayland-client = "*"
