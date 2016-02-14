@@ -1,3 +1,6 @@
+use std::ops::Range;
+use std::cmp::min;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Direction {Forward, Reverse}
 use self::Direction::*;
@@ -79,9 +82,53 @@ pub fn bidi_algorithm(streaks: &mut [Item]) {}
 
 pub struct FontPreference<'a>(Font<'a>);
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FWord(i16);
+
+macro_rules! try_opt {
+	($e:expr) => (match $e {Some(x)=>x, None=>return None})
+}
+
 /// contains glyphs and typesetting information
 #[derive(PartialEq, Clone, Copy)]
-pub struct FontCollection<'a>(&'a[u8]);
+pub struct FontCollection<'a>{
+	tables: TableDirectory<'a>
+}
+#[derive(PartialEq, Clone, Copy)]
+pub struct TableDirectory<'a>{
+	data: &'a[u8],
+	num_tables: u16
+}
+impl<'a> TableDirectory<'a> {
+	fn new(data: &'a[u8]) -> Option<TableDirectory<'a>> {
+		if data.len() < 12 {return None}
+		let version = read_u32(data);
+		if version != Some(0x10000) && version != Some(0x4f54544f) {return None}
+		let num_tables = try_opt!(read_u16(&data[4..]));
+		if data.len() < num_tables as usize*16 + 12 {
+			None
+		} else {
+			Some(TableDirectory {
+				data: data,
+				num_tables: num_tables
+			})
+		}
+	}
+	fn find(&self, start: u16, label: u32) -> Option<(u16, &[u8])> {
+		for pos_ in start..self.num_tables {
+			let pos = pos_ as usize;
+			let candidate = try_opt!(read_u32(&self.data[12+16*pos..]));
+			if candidate == label {
+				let start = read_u32(&self.data[12+16*pos+8..]).unwrap() as usize;
+				return Some((pos as u16, &self.data[start..read_u32(&self.data[12+16*pos+12..]).unwrap() as usize+start]));
+			} else if candidate > label {
+				return None
+			}
+		}
+		None
+	}
+}
+
 /// what features of the font collection do we want to use?
 pub struct FontConfiguration;
 
@@ -90,12 +137,6 @@ pub struct FontConfiguration;
 pub struct Font<'a>{
 	pub cmap: CMap<'a>,
 	glyph_src: &'a FontCollection<'a>
-}
-
-struct GlyphPoint(i16, i16);
-enum ContourSegment {
-	Line(GlyphPoint, GlyphPoint),
-	Curve(GlyphPoint, GlyphPoint, GlyphPoint)
 }
 
 pub fn read_u32(data: &[u8]) -> Option<u32> {
@@ -121,20 +162,6 @@ fn fourcc(tag: u32) -> String {
 	s.push((tag >> 8) as u8 as char);
 	s.push(tag as u8 as char);
 	s
-}
-
-macro_rules! try_opt {
-	($e:expr) => (match $e {Some(x)=>x, None=>return None})
-}
-
-fn scan_table_records(data: &[u8], start: usize, label: u32, num_tables: usize) -> Option<(usize, &[u8])> {
-	for pos in start..num_tables {
-		if try_opt!(read_u32(&data[12+16*pos..])) == label {
-			let start = read_u32(&data[12+16*pos+8..]).unwrap() as usize;
-			return Some((pos, &data[start..read_u32(&data[12+16*pos+12..]).unwrap() as usize+start]));
-		}
-	}
-	None
 }
 
 fn find_best_cmap(cmap: &[u8]) -> Option<&[u8]> {
@@ -229,15 +256,17 @@ fn load_enc_table(mut enc: &[u8]) -> Option<Encoding> {
 }
 
 pub fn load_font_collection(data: &[u8]) -> Option<FontCollection> {
-	Some(FontCollection(data))
+	let tables = try_opt!(TableDirectory::new(data));
+	Some(FontCollection {
+		tables: tables
+	})
 }
 
 static CMAP_TAG: u32 = 0x636d6170;
+static HHEA_TAG: u32 = 0x68686561;
 
 pub fn load_font<'a>(collection: &'a FontCollection<'a>, font: &str) -> Option<Font<'a>> {
-	let data = collection.0;
-	let num_tables = try_opt!(read_u16(&data[4..])) as usize;
-	let (_pos, cmap) = try_opt!(scan_table_records(data, 0, CMAP_TAG, num_tables));
+	let (_pos, cmap) = try_opt!(collection.tables.find(0, CMAP_TAG));
 	let best_enc = try_opt!(find_best_cmap(cmap));
 	let enc = try_opt!(load_enc_table(best_enc));
 	Some(Font {cmap: CMap(enc), glyph_src: collection})
@@ -247,71 +276,113 @@ pub fn load_font<'a>(collection: &'a FontCollection<'a>, font: &str) -> Option<F
 pub struct GlyphIndex(u16);
 
 #[derive(Debug, Clone, Copy)]
-pub struct GlyphMap<'text> {
+pub struct MappedGlyph<'text> {
 	pub range: &'text str,
-	pub dir: Direction,
-	pub glyph_off: usize,
-	pub span: u16	// between which caret positions of a ligature?
+	pub glyph: GlyphIndex,
+	pub dir: Direction
 }
 
-pub struct Burst<'text, 'a> {
-	pub glyphs: Vec<GlyphIndex>,
-	pub font: &'a FontCollection<'a>,
-	pub dir: ItemTypesetting,
-	pub glyph_map: Vec<GlyphMap<'text>>
+pub trait CharMapper {
+	/// given the text of the cluster, the character index relative to cluster start and the position within that character, return the byte offset into the cluster, where the cursor is
+	fn map_cursor(&self, text: &str, character: usize, pos: Fractional) -> usize;
+	fn map_range(&self, range: Range<usize>) -> Vec<Range<usize>>;
 }
 
-pub fn shape<'text, 'a, 'b: 'a>(item: Item<'text>, font: &'a Font<'b>) -> Option<Burst<'text, 'b>> {
-	let (mut glyphs, mut glyph_map) = (Vec::with_capacity(item.text.len()), Vec::with_capacity(item.text.len()));	// 1 char ⇒ 1 glyph (at this stage) is at least one byte long
-	let mut rest = item.text;
-	while rest.len() > 0 {
-		let c = rest.chars().next().unwrap();
-		let idx = try_opt!(font.cmap.lookup(c));
-		glyphs.push(idx);
-		let size = c.len_utf8();
-		glyph_map.push(GlyphMap {
-			range: &rest[..size],
-			dir: Forward,
-			glyph_off: glyphs.len() - 1,
-			span: 0
-		});
-		rest = &rest[size..];
-	}
-	Some(Burst {glyphs: glyphs, glyph_map: glyph_map, font: font.glyph_src, dir: item.dir})
+pub trait Shaper {
+	type CharMapper: CharMapper;
+	/// segment the string into clusters, shape the clusters and look up the glyphs (with given callback)
+	///
+	/// first result is the characters, second the pairs of (first character index of cluster, string offset of cluster start)
+	fn shape<T, F: FnMut(char) -> Option<T>>(&self, text: &str, lookup: &mut F) -> Option<(Vec<T>, Self::CharMapper)>;
 }
 
-pub fn merge_bursts<'text, 'a, I: IntoIterator<Item=Burst<'text, 'a>>>(bursts: I) -> Vec<Burst<'text, 'a>> {
-	let iter = bursts.into_iter();
-	let mut res: Vec<Burst> = Vec::with_capacity(iter.size_hint().0);
-	for mut burst in iter {
-		if let Some(last) = res.last_mut() {
-			if burst.dir == last.dir && *burst.font == *last.font {
-				if burst.dir.effective_direction() == Forward {
-					last.glyphs.extend_from_slice(&burst.glyphs);
-					last.glyph_map.extend_from_slice(&burst.glyph_map);
-				} else {
-					burst.glyphs.extend_from_slice(&last.glyphs);
-					last.glyphs = burst.glyphs;
-					burst.glyph_map.extend_from_slice(&last.glyph_map);
-					last.glyph_map = burst.glyph_map;
-				}
-				continue
+static MAX_UTF8_LEN: usize = 4;
+
+#[derive(Clone, Copy, PartialOrd, Ord, PartialEq, Eq)]
+pub struct Fractional(u32);
+static FRACTIONAL_CENTER: Fractional = Fractional(0x80000000);
+
+pub struct BasicShaper;
+impl Shaper for BasicShaper {
+	type CharMapper = BasicCharMapper;
+	fn shape<T, F: FnMut(char) -> Option<T>>(&self, text: &str, lookup: &mut F) -> Option<(Vec<T>, BasicCharMapper)> {
+		let (mut chars, mut clusters) = (Vec::with_capacity(text.len()/MAX_UTF8_LEN), Vec::with_capacity(text.len()/MAX_UTF8_LEN));
+		for (i, c) in text.char_indices() {
+			chars.push(try_opt!(lookup(c)));
+			let last_cluster = clusters.last().cloned().unwrap_or((0, 0));
+			let char_size = c.len_utf8();
+			if char_size > 1 {
+				clusters.push((chars.len(), i+char_size));
 			}
 		}
-		res.push(burst);
+		let num_chars = chars.len();
+		Some((chars, BasicCharMapper(num_chars, clusters)))
 	}
-	res
+}
+
+/// Simple cluster mapping (cluster = 0.. ASCII chars (len=1) + 0..1 non-ASCII)
+/// Tuples are cluster boundaries as (char idx, string offset), a first (0, 0) and the last (num chars, str len) are implied
+/// Rationale: compared to cluster=1char, this saves memory for text containing ASCII (no heap alloc for pure ASCII) while being cheap to compute
+#[derive(Debug)]
+pub struct BasicCharMapper(usize, Vec<(usize, usize)>);
+impl CharMapper for BasicCharMapper {
+	fn map_cursor(&self, text: &str, character: usize, pos: Fractional) -> usize {unimplemented!()}
+	fn map_range(&self, range: Range<usize>) -> Vec<Range<usize>> {
+		println!("{:?}", range);
+		let translate = |pos:usize| {
+			let (cluster_offset, cluster_start, cluster_end) = match self.1.binary_search_by(|&(_, cstart)| cstart.cmp(&pos)) {
+				Err(0) => (0, 0, self.1.first().map_or(self.0, |&(x, _)| x)),
+				Ok(x) => (self.1[x].1, self.1[x].0, self.1.get(x+1).map_or(self.0, |&(_, x)| x)),
+				Err(x) => (self.1[x-1].1, self.1[x-1].0, self.1.get(x).map_or(self.0, |&(_, x)| x))
+			};
+			println!("{:?}", (cluster_offset, cluster_start, cluster_end));
+			min(pos-cluster_offset, cluster_end-cluster_start) + cluster_start
+		};
+		vec![translate(range.start)..translate(range.end)]
+	}
 }
 
 #[test]
-fn test_burst_merge() {
-	let fc = FontCollection(&[]);
-	let res = merge_bursts(vec![
-		Burst {glyphs: Vec::new(), font: &fc, dir: ItemTypesetting(DirBehavior(Forward, Perpendicular), Rot180::Rotated), glyph_map: Vec::new()},
-		Burst {glyphs: vec![GlyphIndex(2)], font: &fc, dir: ItemTypesetting(DirBehavior(Reverse, Perpendicular), Rot180::Normal), glyph_map: Vec::new()},
-		Burst {glyphs: vec![GlyphIndex(1)], font: &fc, dir: ItemTypesetting(DirBehavior(Reverse, Perpendicular), Rot180::Normal), glyph_map: Vec::new()},
-		Burst {glyphs: Vec::new(), font: &fc, dir: ItemTypesetting(DirBehavior(Forward, Perpendicular), Rot180::Normal), glyph_map: Vec::new()}
-	]);
-	assert_eq!(res.len(), 3);
-	assert_eq!(res[1].glyphs, vec![GlyphIndex(1), GlyphIndex(2)]);
+fn test_basic_shaper() {
+	let data = &[
+		"",
+		"Abc",
+		"Test123",
+		"Übung",	// multibyte char at the beginning
+		"Weiß"	// multibyte char at the end
+	];
+	for case in data {
+		let (chars, mapper) = BasicShaper.shape(case, &mut|x:char| Some(x)).unwrap();
+		assert_eq!(chars, case.chars().collect::<Vec<char>>());
+		println!("{:?}, {:?}", case, mapper);
+		for (cidx, (i, c)) in case.char_indices().enumerate() {
+			assert_eq!(&mapper.map_range(i..case.len()), &[cidx..chars.len()]);
+		}
+		for (cidx, (i, c)) in case.char_indices().rev().enumerate() {
+			assert_eq!(&mapper.map_range(0..i), &[0..chars.len()-1-cidx]);
+		}
+	}
+}
+
+pub struct PositionedGlyph {
+	glyph: GlyphIndex,
+	start: DesignUnits,
+	pos_main: DesignUnits,
+	pos_cross: DesignUnits
+}
+
+struct Layout {
+	glyphs: Vec<PositionedGlyph>,
+	length: DesignUnits
+}
+
+struct DesignUnits(u32);
+
+enum JustificationMode {
+	Default,
+	Shortest,
+	Longest,
+	Target {
+		length: DesignUnits
+	}
 }
