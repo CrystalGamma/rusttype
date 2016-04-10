@@ -1,5 +1,6 @@
 use std::ops::Range;
-use std::cmp::min;
+use std::cmp::{min, Ordering};
+use std::error::Error;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Direction {Forward, Reverse}
@@ -92,7 +93,8 @@ macro_rules! try_opt {
 /// contains glyphs and typesetting information
 #[derive(PartialEq, Clone, Copy)]
 pub struct FontCollection<'a>{
-	tables: TableDirectory<'a>
+	pub tables: TableDirectory<'a>,
+	pub gsub: Option<GSub<'a>>
 }
 #[derive(PartialEq, Clone, Copy)]
 pub struct TableDirectory<'a>{
@@ -100,21 +102,21 @@ pub struct TableDirectory<'a>{
 	num_tables: u16
 }
 impl<'a> TableDirectory<'a> {
-	fn new(data: &'a[u8]) -> Option<TableDirectory<'a>> {
-		if data.len() < 12 {return None}
+	fn new(data: &[u8]) -> Result<TableDirectory, CorruptFont> {
+		if data.len() < 12 {return Err(CorruptFont(data, TableTooShort))}
 		let version = read_u32(data);
-		if version != Some(0x10000) && version != Some(0x4f54544f) {return None}
-		let num_tables = try_opt!(read_u16(&data[4..]));
+		if version != Some(0x10000) && version != Some(0x4f54544f) {return Err(CorruptFont(data, ReservedFeature))}
+		let num_tables = read_u16(&data[4..]).unwrap();
 		if data.len() < num_tables as usize*16 + 12 {
-			None
+			Err(CorruptFont(data, TableTooShort))
 		} else {
-			Some(TableDirectory {
+			Ok(TableDirectory {
 				data: data,
 				num_tables: num_tables
 			})
 		}
 	}
-	fn find(&self, start: u16, label: u32) -> Option<(u16, &[u8])> {
+	fn find(&self, start: u16, label: u32) -> Option<(u16, &'a[u8])> {
 		for pos_ in start..self.num_tables {
 			let pos = pos_ as usize;
 			let candidate = try_opt!(read_u32(&self.data[12+16*pos..]));
@@ -155,7 +157,7 @@ pub fn read_u16(data: &[u8]) -> Option<u16> {
 	}
 }
 
-fn fourcc(tag: u32) -> String {
+pub fn fourcc(tag: u32) -> String {
 	let mut s = String::with_capacity(4);
 	s.push((tag >> 24) as u8 as char);
 	s.push((tag >> 16) as u8 as char);
@@ -206,13 +208,13 @@ impl<'a> Encoding<'a> {
 				let seg_offset = range.start*2;
 				let block_start = read_u16(&start[seg_offset..]).unwrap();
 				if block_start > c as u16 {return Some(GlyphIndex(0))}
-				let block_index = c as u16 - block_start;
 				return Some(GlyphIndex((read_u16(&delta[seg_offset..]).unwrap()).wrapping_add({
 					let offset = read_u16(&range_offset[seg_offset..]).unwrap();
 					if offset == 0 {
-						block_index
+						println!("delta: {} start: {}", read_u16(&delta[seg_offset..]).unwrap(), block_start);
+						c as u16
 					} else {	// this path is untested because the spec is really weird and I've never seen it used
-						let res = read_u16(&range_offset[seg_offset+(offset as usize &!1)+block_index as usize..]).unwrap();
+						let res = read_u16(&range_offset[seg_offset+(offset as usize &!1)+(c as usize - block_start as usize)..]).unwrap();
 						if res == 0 {
 							return Some(GlyphIndex(0))
 						} else {
@@ -233,43 +235,48 @@ struct CmapFmt4<'a> {
 	crazy_indexing_part: &'a[u8]
 }
 
-fn load_enc_table(mut enc: &[u8]) -> Option<Encoding> {
-	let format = try_opt!(read_u16(enc));
+fn load_enc_table(mut enc: &[u8]) -> Result<Encoding, CorruptFont> {
+	if enc.len() < 4 {return Err(CorruptFont(enc, TableTooShort))}
+	let format = read_u16(enc).unwrap();
 	match format {
 		4 => {
-			let len = try_opt!(read_u16(&enc[2..])) as usize;
-			if len > enc.len() {return None}
+			let len = read_u16(&enc[2..]).unwrap() as usize;
+			if len > enc.len() && len < 14 {return Err(CorruptFont(enc, TableTooShort))}
 			enc = &enc[..len];
-			let segsX2 = try_opt!(read_u16(&enc[6..])) as usize;
-			if segsX2 < 2 || segsX2 % 2 != 0 || 4*segsX2 + 16 < len {return None}
+			let segsX2 = read_u16(&enc[6..]).unwrap() as usize;
+			if segsX2 % 2 != 0 {return Err(CorruptFont(enc, OddSegsX2))}
+			if segsX2 < 2 || 4*segsX2 + 16 > len {return Err(CorruptFont(enc, CmapInvalidSegmentCount))}
 			let end = &enc[14..14+segsX2];
-			if read_u16(&end[segsX2-2..]).unwrap() != 0xffff {return None}
-			Some(Encoding::Fmt4(CmapFmt4{
+			if read_u16(&end[segsX2-2..]).unwrap() != 0xffff {return Err(CorruptFont(enc, CmapMissingGuard))}
+			Ok(Encoding::Fmt4(CmapFmt4{
 				end: end,
 				start: &enc[16+segsX2..16+2*segsX2],
 				delta: &enc[16+2*segsX2..16+3*segsX2],
 				crazy_indexing_part: &enc[16+3*segsX2..]
 			}))
 		},
-		_ => None	// not implemented
+		_ => Err(CorruptFont(enc, Unimplemented))
 	}
 }
 
-pub fn load_font_collection(data: &[u8]) -> Option<FontCollection> {
-	let tables = try_opt!(TableDirectory::new(data));
-	Some(FontCollection {
+pub fn load_font_collection(data: &[u8]) -> Result<FontCollection, CorruptFont> {
+	let tables = try!(TableDirectory::new(data));
+	println!("#glyphs: {:?}", tables.find(0, 0x6d617870).and_then(|x|read_u16(&x.1[4..])));
+	Ok(FontCollection {
+		gsub: tables.find(0, GSUB_TAG).and_then(|x|GSub::new(x.1)),
 		tables: tables
 	})
 }
 
 static CMAP_TAG: u32 = 0x636d6170;
 static HHEA_TAG: u32 = 0x68686561;
+static GSUB_TAG: u32 = 0x47535542;
 
-pub fn load_font<'a>(collection: &'a FontCollection<'a>, font: &str) -> Option<Font<'a>> {
-	let (_pos, cmap) = try_opt!(collection.tables.find(0, CMAP_TAG));
-	let best_enc = try_opt!(find_best_cmap(cmap));
-	let enc = try_opt!(load_enc_table(best_enc));
-	Some(Font {cmap: CMap(enc), glyph_src: collection})
+pub fn load_font<'a>(collection: &'a FontCollection<'a>, font: &str) -> Result<Font<'a>, CorruptFont<'a>> {
+	let (_pos, cmap) = try!(collection.tables.find(0, CMAP_TAG).ok_or(CorruptFont(collection.tables.data, NoCmap)));
+	let best_enc = try!(find_best_cmap(cmap).ok_or(CorruptFont(cmap, NoCmap)));
+	let enc = try!(load_enc_table(best_enc));
+	Ok(Font {cmap: CMap(enc), glyph_src: collection})
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -328,14 +335,12 @@ pub struct BasicCharMapper(usize, Vec<(usize, usize)>);
 impl CharMapper for BasicCharMapper {
 	fn map_cursor(&self, text: &str, character: usize, pos: Fractional) -> usize {unimplemented!()}
 	fn map_range(&self, range: Range<usize>) -> Vec<Range<usize>> {
-		println!("{:?}", range);
 		let translate = |pos:usize| {
 			let (cluster_offset, cluster_start, cluster_end) = match self.1.binary_search_by(|&(_, cstart)| cstart.cmp(&pos)) {
 				Err(0) => (0, 0, self.1.first().map_or(self.0, |&(x, _)| x)),
 				Ok(x) => (self.1[x].1, self.1[x].0, self.1.get(x+1).map_or(self.0, |&(_, x)| x)),
 				Err(x) => (self.1[x-1].1, self.1[x-1].0, self.1.get(x).map_or(self.0, |&(_, x)| x))
 			};
-			println!("{:?}", (cluster_offset, cluster_start, cluster_end));
 			min(pos-cluster_offset, cluster_end-cluster_start) + cluster_start
 		};
 		vec![translate(range.start)..translate(range.end)]
@@ -354,7 +359,6 @@ fn test_basic_shaper() {
 	for case in data {
 		let (chars, mapper) = BasicShaper.shape(case, &mut|x:char| Some(x)).unwrap();
 		assert_eq!(chars, case.chars().collect::<Vec<char>>());
-		println!("{:?}, {:?}", case, mapper);
 		for (cidx, (i, c)) in case.char_indices().enumerate() {
 			assert_eq!(&mapper.map_range(i..case.len()), &[cidx..chars.len()]);
 		}
@@ -363,6 +367,243 @@ fn test_basic_shaper() {
 		}
 	}
 }
+
+trait GlyphMapper {
+	fn new() -> Self;
+	fn map_char_to_glyph(&self, char_idx: usize, pos: Fractional) -> Option<(usize, Fractional)>;
+	fn map_glyph_to_char(&self, glyph_idx: usize, pos: Fractional) -> Option<(usize, Fractional)>;
+}
+trait MonotonicSubstitution {
+	type GlyphMapper: GlyphMapper;
+	/// performs the substitution. Returns the number of characters affected.
+	fn substitute_mutate(&self, forward: &mut Vec<GlyphIndex>, backward: &mut Vec<GlyphIndex>, map_fwd: &mut Self::GlyphMapper, map_bwd: &mut Self::GlyphMapper) -> Option<usize>;
+	fn substitute(&self, mut glyphs: Vec<GlyphIndex>) -> Option<(Vec<GlyphIndex>, Self::GlyphMapper)> {
+		let (mut m1, mut m2) = (Self::GlyphMapper::new(), Self::GlyphMapper::new());
+		try_opt!(self.substitute_mutate(&mut glyphs, &mut Vec::new(), &mut m1, &mut m2));
+		Some((glyphs, m1))
+	}
+}
+
+#[derive(Clone, Copy, Debug)]
+enum FontCorruption {
+	Unimplemented,
+	ReservedFeature,
+	TableTooShort,
+	OffsetOutOfBounds,
+	IncorrectDfltScript,
+	CmapInvalidSegmentCount,
+	OddSegsX2,
+	CmapMissingGuard,
+	NoCmap
+}
+use FontCorruption::*;
+
+#[derive(Clone, Copy, Debug)]
+pub struct CorruptFont<'a>(&'a[u8], FontCorruption);
+
+impl<'a> Error for CorruptFont<'a> {
+	fn description(&self) -> &str {match self.1 {
+		Unimplemented => "The font uses a feature that is not implemented",
+		ReservedFeature => "A reserved field differed from the default value",
+		TableTooShort => "Unexpected end of table",
+		OffsetOutOfBounds => "An Offset pointed outside of the respective table",
+		IncorrectDfltScript => "'DFLT' script with missing DefaultLangSys or LangSysCount ≠ 0",
+		CmapInvalidSegmentCount => "The segment count in the character mapping is invalid",
+		OddSegsX2 => "The doubled segment count in the character mapping is not an even number",
+		CmapMissingGuard => "The character mapping is missing a guard value",
+		NoCmap => "No character mapping found"
+	}}
+}
+impl<'a> ::std::fmt::Display for CorruptFont<'a> {
+	fn fmt(&self, f: &mut ::std::fmt::Formatter) -> Result<(), ::std::fmt::Error> {
+		write!(f, "{}", self.description())
+	}
+}
+
+pub trait SearchStrategy<Idx> {
+	/// do the search. The argument to the callback may never leave the given range.
+	/// returns Ok(idx) when found, Err(Ok(idx)) when not found and Err(Err((idx, error))) when the callback returned Err(error) at pos idx
+	fn search<E, F: FnMut(&Idx) -> Result<Ordering, E>>(&self, range: Range<Idx>, func: &mut F) -> Result<Idx, Result<Idx, (Idx, E)>>;
+}
+
+pub struct LinearSearch;
+pub struct BinarySearch;
+macro_rules! impl_strategies {($typ: ty) => (
+	impl SearchStrategy<$typ> for LinearSearch {
+		fn search<E, F: FnMut(&$typ) -> Result<Ordering, E>>(&self, range: Range<$typ>, func: &mut F) -> Result<$typ, Result<$typ, ($typ, E)>> {
+			for i in range.clone() {	// for some reason Range does not derive Copy
+				match func(&i) {
+					Ok(Ordering::Equal) => return Ok(i),
+					Ok(Ordering::Greater) => return Err(Ok(i)),
+					Err(e) => return Err(Err((i, e))),
+					_ => {}
+				}
+			}
+			Err(Ok(range.end))
+		}
+	}
+	impl SearchStrategy<$typ> for BinarySearch {
+		fn search<E, F: FnMut(&$typ) -> Result<Ordering, E>>(&self, mut range: Range<$typ>, func: &mut F) -> Result<$typ, Result<$typ, ($typ, E)>> {
+			assert!(range.start <= range.end);
+			while range.start != range.end {
+				let pivot = (range.end - range.start) / 2 + range.start;
+				match func(&pivot) {
+					Ok(Ordering::Equal) => return Ok(pivot),
+					Ok(Ordering::Greater) => {range.end = pivot},
+					Err(e) => return Err(Err((pivot, e))),
+					_ => {range.start = pivot + 1}
+				}
+			}
+			Err(Ok(range.start))
+		}
+	}
+	impl SearchStrategy<$typ> for AutoSearch {
+		fn search<E, F: FnMut(&$typ) -> Result<Ordering, E>>(&self, range: Range<$typ>, func: &mut F) -> Result<$typ, Result<$typ, ($typ, E)>> {
+			match *self {
+				AutoSearch::Bin => BinarySearch.search(range, func),
+				AutoSearch::Lin => LinearSearch.search(range, func)
+			}
+		}
+	}
+)}
+impl_strategies!(u8);
+impl_strategies!(u16);
+impl_strategies!(u32);
+impl_strategies!(usize);
+
+pub enum AutoSearch {Lin, Bin}
+impl AutoSearch {fn new(list_size: usize) -> AutoSearch {if list_size > 4096 {AutoSearch::Bin} else {AutoSearch::Lin}}}
+
+#[derive(Debug)]
+pub struct FeatureIndex(pub u16);
+
+pub struct LangSysTable<'a>(&'a[u8]);
+
+impl<'a> LangSysTable<'a> {
+	pub fn new(data: &'a[u8]) -> Result<LangSysTable<'a>, CorruptFont<'a>> {
+		if data.len() < 6 {return Err(CorruptFont(data, TableTooShort))}
+		if read_u16(data).unwrap() != 0 {return Err(CorruptFont(data, ReservedFeature))}
+		let num_features = read_u16(&data[4..]).unwrap();
+		if data.len() - 6 < num_features as usize*2 {return Err(CorruptFont(data, TableTooShort))}
+		Ok(LangSysTable(&data[2..num_features as usize*2 + 6]))
+	}
+	pub fn num_features(&self) -> u16 {(self.0.len() / 2 - 2) as u16}
+	pub fn required_feature(&self) -> Option<FeatureIndex> {
+		let res = read_u16(self.0).unwrap();
+		if res == 0xffff {None} else {Some(FeatureIndex(res))}
+	}
+	pub fn get_feature(&self, idx: u16) -> Option<FeatureIndex> {read_u16(&self.0[2 + idx as usize*2..]).map(|x| FeatureIndex(x))}
+}
+
+static DEFAULT_LANGSYS_TABLE: [u8; 4] = [255, 255, 0, 0];
+
+impl<'a> Default for LangSysTable<'a> {
+	fn default() -> LangSysTable<'a> {LangSysTable(&DEFAULT_LANGSYS_TABLE)}
+}
+
+pub struct ScriptTag(pub u32);
+pub struct LangSysTag(pub u32);
+
+pub struct ScriptTable<'a>(&'a[u8]);
+
+impl<'a> ScriptTable<'a> {
+	pub fn new(data: &'a[u8]) -> Result<ScriptTable<'a>, CorruptFont<'a>> {
+		if data.len() < 4 {return Err(CorruptFont(data, TableTooShort))}
+		let lang_sys_count = read_u16(&data[2..]).unwrap();
+		println!("LS count {:x}", lang_sys_count);
+		if data.len() - 4 < lang_sys_count as usize*6 {return Err(CorruptFont(data, TableTooShort))}
+		Ok(ScriptTable(data))
+	}
+	pub fn default_lang_sys(&self) -> Result<LangSysTable<'a>, CorruptFont<'a>> {
+		let offset = read_u16(self.0).unwrap() as usize;
+		println!("LS offset {:x}", offset);
+		if offset == 0 {
+			Ok(Default::default())
+		} else {
+			if self.0.len() < offset {return Err(CorruptFont(self.0, OffsetOutOfBounds))}
+			LangSysTable::new(&self.0[offset..])
+		}
+	}
+	pub fn num_lang_sys(&self) -> u16 {(self.0.len() / 6 - 4) as u16}
+	pub fn validate_dflt(&self) -> Result<(), CorruptFont<'a>> {
+		if read_u16(self.0).unwrap() != 0 && self.num_lang_sys() == 0 {
+			Ok(())
+		} else {
+			Err(CorruptFont(self.0, IncorrectDfltScript))
+		}
+	}
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct ScriptList<'a>(&'a[u8]);
+
+impl<'a> ScriptList<'a> {
+	pub fn new(data: &'a[u8]) -> Option<ScriptList<'a>> {
+		if data.len() < 2 {return None}
+		let res = ScriptList(data);
+		if data.len() < res.num_scripts() as usize*6 + 2 {return None}
+		Some(res)
+	}
+	pub fn num_scripts(&self) -> u16 {read_u16(self.0).unwrap()}
+	pub fn script_tag(&self, idx: u16) -> Option<ScriptTag> {read_u32(&self.0[idx as usize*6+2..]).map(|x|ScriptTag(x))}
+	pub fn script_table_by_index(&self, script_index: u16) -> Result<ScriptTable<'a>, CorruptFont<'a>> {
+		let offset_pos = &self.0[script_index as usize*6 + 6..];
+		let offset = read_u16(offset_pos).unwrap() as usize;
+		if self.0.len() < offset {return Err(CorruptFont(offset_pos, OffsetOutOfBounds))}
+		println!("offset {:x}", offset);
+		ScriptTable::new(&self.0[offset..])
+	}
+	pub fn features_for(&self, selector: Option<(ScriptTag, Option<LangSysTag>)>) -> Result<LangSysTable<'a>, CorruptFont<'a>> {
+		let search = AutoSearch::new(self.num_scripts() as usize*6);
+		if let Some((script, lang_sys_opt)) = selector {
+			match search.search(0..self.num_scripts(), &mut move|&i| Ok(self.script_tag(i).unwrap().0.cmp(&script.0))) {
+				Ok(idx) => {
+					let script_table = try!(self.script_table_by_index(idx));
+					if let Some(lang_sys) = lang_sys_opt {
+						unimplemented!()
+					} else {
+						return script_table.default_lang_sys()
+					}
+				},
+				Err(Ok(_)) => {println!("default");return Ok(Default::default())},
+				Err(Err((_, e))) => return Err(e)
+			}
+		}
+		match search.search(0..self.num_scripts(), &mut move|&i| Ok(self.script_tag(i).unwrap().0.cmp(&DFLT_TAG.0))) {
+			Ok(i) => {
+				let script_table = try!(self.script_table_by_index(i));
+				try!(script_table.validate_dflt());
+				script_table.default_lang_sys()
+			},
+			Err(Ok(_)) => Ok(Default::default()),
+			Err(Err((_, e))) => Err(e)
+		}
+	}
+}
+
+static DFLT_TAG: ScriptTag = ScriptTag(0x44464c54);
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct GSub<'a> {
+	pub script_list: ScriptList<'a>,
+	pub feature_list: (),
+	pub lookup_list: ()
+}
+
+impl<'a> GSub<'a> {
+	fn new(data: &'a[u8]) -> Option<GSub<'a>> {
+		if data.len() < 10 {return None}
+		if read_u32(data) != Some(0x00010000) {return None}
+		let scr_off = try_opt!(read_u16(&data[4..])) as usize;
+		if data.len() < scr_off + 2 {return None}
+		Some(GSub {
+			script_list: try_opt!(ScriptList::new(&data[scr_off..])),
+			feature_list: (),
+			lookup_list: ()
+		})
+	}
+}
+
 
 pub struct PositionedGlyph {
 	glyph: GlyphIndex,
