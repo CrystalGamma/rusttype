@@ -262,8 +262,11 @@ fn load_enc_table(mut enc: &[u8]) -> Result<Encoding, CorruptFont> {
 pub fn load_font_collection(data: &[u8]) -> Result<FontCollection, CorruptFont> {
 	let tables = try!(TableDirectory::new(data));
 	println!("#glyphs: {:?}", tables.find(0, 0x6d617870).and_then(|x|read_u16(&x.1[4..])));
+	let gsub = if let Some(x) = tables.find(0, GSUB_TAG) {
+		Some(try!(GSub::new(x.1)))
+	} else {None};
 	Ok(FontCollection {
-		gsub: tables.find(0, GSUB_TAG).and_then(|x|GSub::new(x.1)),
+		gsub: gsub,
 		tables: tables
 	})
 }
@@ -394,7 +397,8 @@ enum FontCorruption {
 	CmapInvalidSegmentCount,
 	OddSegsX2,
 	CmapMissingGuard,
-	NoCmap
+	NoCmap,
+	UnknownTableVersion
 }
 use FontCorruption::*;
 
@@ -411,7 +415,8 @@ impl<'a> Error for CorruptFont<'a> {
 		CmapInvalidSegmentCount => "The segment count in the character mapping is invalid",
 		OddSegsX2 => "The doubled segment count in the character mapping is not an even number",
 		CmapMissingGuard => "The character mapping is missing a guard value",
-		NoCmap => "No character mapping found"
+		NoCmap => "No character mapping found",
+		UnknownTableVersion => "The font uses a table version that is not recognised"
 	}}
 }
 impl<'a> ::std::fmt::Display for CorruptFont<'a> {
@@ -501,19 +506,18 @@ impl<'a> Default for LangSysTable<'a> {
 	fn default() -> LangSysTable<'a> {LangSysTable(&DEFAULT_LANGSYS_TABLE)}
 }
 
-pub struct ScriptTag(pub u32);
-pub struct LangSysTag(pub u32);
-
-pub struct ScriptTable<'a>(&'a[u8]);
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct LangSys;
+pub type ScriptTable<'a> = TagOffsetList<'a, LangSys>;
+impl<'a> TagListTable<'a> for LangSys {
+	type Table = LangSysTable<'a>;
+	fn bias() -> usize {2}
+	fn new(data: &'a[u8]) -> Result<Self::Table, CorruptFont<'a>> {LangSysTable::new(data)}
+}
+impl Tagged for LangSys {}
 
 impl<'a> ScriptTable<'a> {
-	pub fn new(data: &'a[u8]) -> Result<ScriptTable<'a>, CorruptFont<'a>> {
-		if data.len() < 4 {return Err(CorruptFont(data, TableTooShort))}
-		let lang_sys_count = read_u16(&data[2..]).unwrap();
-		println!("LS count {:x}", lang_sys_count);
-		if data.len() - 4 < lang_sys_count as usize*6 {return Err(CorruptFont(data, TableTooShort))}
-		Ok(ScriptTable(data))
-	}
+	pub fn new(data: &'a[u8]) -> Result<ScriptTable<'a>, CorruptFont<'a>> {ScriptTable::new_list(data)}
 	pub fn default_lang_sys(&self) -> Result<LangSysTable<'a>, CorruptFont<'a>> {
 		let offset = read_u16(self.0).unwrap() as usize;
 		println!("LS offset {:x}", offset);
@@ -524,9 +528,8 @@ impl<'a> ScriptTable<'a> {
 			LangSysTable::new(&self.0[offset..])
 		}
 	}
-	pub fn num_lang_sys(&self) -> u16 {(self.0.len() / 6 - 4) as u16}
 	pub fn validate_dflt(&self) -> Result<(), CorruptFont<'a>> {
-		if read_u16(self.0).unwrap() != 0 && self.num_lang_sys() == 0 {
+		if read_u16(self.0).unwrap() != 0 && self.num_tables() == 0 {
 			Ok(())
 		} else {
 			Err(CorruptFont(self.0, IncorrectDfltScript))
@@ -534,31 +537,72 @@ impl<'a> ScriptTable<'a> {
 	}
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub struct ScriptList<'a>(&'a[u8]);
+use std::marker::PhantomData;
 
-impl<'a> ScriptList<'a> {
-	pub fn new(data: &'a[u8]) -> Option<ScriptList<'a>> {
-		if data.len() < 2 {return None}
-		let res = ScriptList(data);
-		if data.len() < res.num_scripts() as usize*6 + 2 {return None}
-		Some(res)
+pub trait TagListTable<'a> {
+	type Table;
+	fn bias() -> usize {0}
+	fn new(data: &'a[u8]) -> Result<Self::Table, CorruptFont<'a>>;
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct TagOffsetList<'a, Table: TagListTable<'a>>(&'a[u8], PhantomData<Table>);
+
+pub trait Tagged {}
+#[derive(Clone, Copy)]
+pub struct Tag<Table: Tagged>(pub u32, PhantomData<Table>);
+impl<T: Tagged> Tag<T> {pub fn new(v: u32) -> Tag<T> {Tag(v, PhantomData)}}
+
+impl<'a, Table: TagListTable<'a> + Tagged> TagOffsetList<'a, Table> {
+	fn new_list(data: &'a[u8]) -> Result<TagOffsetList<'a, Table>, CorruptFont<'a>> {
+		if data.len() < 2 + Table::bias() {return Err(CorruptFont(data, TableTooShort))}
+		let res = TagOffsetList(data, PhantomData);
+		if data.len() < res.num_tables() as usize*6 + 2 + Table::bias() {return Err(CorruptFont(data, TableTooShort))}
+		Ok(res)
 	}
-	pub fn num_scripts(&self) -> u16 {read_u16(self.0).unwrap()}
-	pub fn script_tag(&self, idx: u16) -> Option<ScriptTag> {read_u32(&self.0[idx as usize*6+2..]).map(|x|ScriptTag(x))}
-	pub fn script_table_by_index(&self, script_index: u16) -> Result<ScriptTable<'a>, CorruptFont<'a>> {
-		let offset_pos = &self.0[script_index as usize*6 + 6..];
+	pub fn num_tables(&self) -> u16 {read_u16(&self.0[Table::bias()..]).unwrap()}
+	pub fn tag(&self, idx: u16) -> Option<Tag<Table>> {read_u32(&self.0[idx as usize*6+2+Table::bias()..]).map(|x|Tag(x, PhantomData))}
+	pub fn table(&self, script_index: u16) -> Result<Table::Table, CorruptFont<'a>> {
+		let offset_pos = &self.0[script_index as usize*6 + 6 + Table::bias()..];
 		let offset = read_u16(offset_pos).unwrap() as usize;
 		if self.0.len() < offset {return Err(CorruptFont(offset_pos, OffsetOutOfBounds))}
 		println!("offset {:x}", offset);
-		ScriptTable::new(&self.0[offset..])
+		Table::new(&self.0[offset..])
 	}
-	pub fn features_for(&self, selector: Option<(ScriptTag, Option<LangSysTag>)>) -> Result<LangSysTable<'a>, CorruptFont<'a>> {
-		let search = AutoSearch::new(self.num_scripts() as usize*6);
+}
+impl<'a, Table: TagListTable<'a> + Tagged> IntoIterator for TagOffsetList<'a, Table> {
+	type Item = (Tag<Table>, Table::Table);
+	type IntoIter = TagOffsetIterator<'a, Table>;
+	fn into_iter(self) -> TagOffsetIterator<'a, Table> {TagOffsetIterator(self, 0, PhantomData)}
+}
+
+#[derive(Clone, Copy)]
+pub struct TagOffsetIterator<'a, Table: TagListTable<'a>>(TagOffsetList<'a, Table>, u16, PhantomData<Table>);
+impl<'a, Table: TagListTable<'a> + Tagged> Iterator for TagOffsetIterator<'a, Table> {
+	type Item = (Tag<Table>, Table::Table);
+	fn next(&mut self) -> Option<(Tag<Table>, Table::Table)> {
+		if self.1 >= self.0.num_tables() {
+			None
+		} else {
+			self.1 += 1;
+			Some((self.0.tag(self.1 - 1).unwrap(), self.0.table(self.1 - 1).unwrap()))
+		}
+	}
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct Script;
+pub type ScriptList<'a> = TagOffsetList<'a, Script>;
+impl<'a> TagListTable<'a> for Script {type Table = ScriptTable<'a>; fn new(data: &'a[u8]) -> Result<Self::Table, CorruptFont<'a>> {ScriptTable::new(data)}}
+impl Tagged for Script {}
+impl<'a> ScriptList<'a> {
+	pub fn new(data: &'a[u8]) -> Result<ScriptList<'a>, CorruptFont<'a>> {ScriptList::new_list(data)}
+	pub fn features_for(&self, selector: Option<(Tag<Script>, Option<Tag<LangSys>>)>) -> Result<LangSysTable<'a>, CorruptFont<'a>> {
+		let search = AutoSearch::new(self.num_tables() as usize*6);
 		if let Some((script, lang_sys_opt)) = selector {
-			match search.search(0..self.num_scripts(), &mut move|&i| Ok(self.script_tag(i).unwrap().0.cmp(&script.0))) {
+			match search.search(0..self.num_tables(), &mut move|&i| Ok(self.tag(i).unwrap().0.cmp(&script.0))) {
 				Ok(idx) => {
-					let script_table = try!(self.script_table_by_index(idx));
+					let script_table = try!(self.table(idx));
 					if let Some(lang_sys) = lang_sys_opt {
 						unimplemented!()
 					} else {
@@ -569,9 +613,9 @@ impl<'a> ScriptList<'a> {
 				Err(Err((_, e))) => return Err(e)
 			}
 		}
-		match search.search(0..self.num_scripts(), &mut move|&i| Ok(self.script_tag(i).unwrap().0.cmp(&DFLT_TAG.0))) {
+		match search.search(0..self.num_tables(), &mut move|&i| Ok(self.tag(i).unwrap().0.cmp(&DFLT_TAG.0))) {
 			Ok(i) => {
-				let script_table = try!(self.script_table_by_index(i));
+				let script_table = try!(self.table(i));
 				try!(script_table.validate_dflt());
 				script_table.default_lang_sys()
 			},
@@ -581,7 +625,8 @@ impl<'a> ScriptList<'a> {
 	}
 }
 
-static DFLT_TAG: ScriptTag = ScriptTag(0x44464c54);
+
+static DFLT_TAG: Tag<Script> = Tag(0x44464c54, PhantomData);
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub struct GSub<'a> {
@@ -591,13 +636,13 @@ pub struct GSub<'a> {
 }
 
 impl<'a> GSub<'a> {
-	fn new(data: &'a[u8]) -> Option<GSub<'a>> {
-		if data.len() < 10 {return None}
-		if read_u32(data) != Some(0x00010000) {return None}
-		let scr_off = try_opt!(read_u16(&data[4..])) as usize;
-		if data.len() < scr_off + 2 {return None}
-		Some(GSub {
-			script_list: try_opt!(ScriptList::new(&data[scr_off..])),
+	fn new(data: &'a[u8]) -> Result<GSub<'a>, CorruptFont<'a>> {
+		if data.len() < 10 {return Err(CorruptFont(data, TableTooShort))}
+		if read_u32(data) != Some(0x00010000) {return Err(CorruptFont(data, UnknownTableVersion))}
+		let scr_off = read_u16(&data[4..]).unwrap() as usize;
+		if data.len() < scr_off + 2 {return Err(CorruptFont(data, TableTooShort))}
+		Ok(GSub {
+			script_list: try!(ScriptList::new(&data[scr_off..])),
 			feature_list: (),
 			lookup_list: ()
 		})
