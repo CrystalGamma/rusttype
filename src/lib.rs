@@ -625,13 +625,32 @@ impl<'a> ScriptList<'a> {
 	}
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct Feature;
+pub type FeatureList<'a> = TagOffsetList<'a, Feature>;
+impl<'a> TagListTable<'a> for Feature {type Table = FeatureTable<'a>; fn new(data: &'a[u8]) -> Result<Self::Table, CorruptFont<'a>> {FeatureTable::new(data)}}
+impl Tagged for Feature {}
+
+impl<'a> FeatureList<'a> {fn new(data: &'a[u8]) -> Result<FeatureList<'a>, CorruptFont<'a>> {FeatureList::new_list(data)}}
+
+pub struct FeatureTable<'a>(&'a[u8]);
+impl<'a> FeatureTable<'a> {
+	fn new(data: &'a[u8]) -> Result<FeatureTable<'a>, CorruptFont<'a>> {
+		if data.len() < 4 {return Err(CorruptFont(data, TableTooShort))}
+		if read_u16(data).unwrap() != 0 {return Err(CorruptFont(data, ReservedFeature))}
+		let len = read_u16(&data[2..]).unwrap();
+		if len as usize*2+4 > data.len() {return Err(CorruptFont(data, TableTooShort))}
+		Ok(FeatureTable(&data[4..len as usize*2+4]))
+	}
+}
 
 static DFLT_TAG: Tag<Script> = Tag(0x44464c54, PhantomData);
+
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub struct GSub<'a> {
 	pub script_list: ScriptList<'a>,
-	pub feature_list: (),
+	pub feature_list: FeatureList<'a>,
 	pub lookup_list: ()
 }
 
@@ -641,9 +660,10 @@ impl<'a> GSub<'a> {
 		if read_u32(data) != Some(0x00010000) {return Err(CorruptFont(data, UnknownTableVersion))}
 		let scr_off = read_u16(&data[4..]).unwrap() as usize;
 		if data.len() < scr_off + 2 {return Err(CorruptFont(data, TableTooShort))}
+		let feat_off = read_u16(&data[6..]).unwrap() as usize;
 		Ok(GSub {
 			script_list: try!(ScriptList::new(&data[scr_off..])),
-			feature_list: (),
+			feature_list: try!(FeatureList::new(&data[scr_off..])),
 			lookup_list: ()
 		})
 	}
