@@ -398,7 +398,9 @@ enum FontCorruption {
 	OddSegsX2,
 	CmapMissingGuard,
 	NoCmap,
-	UnknownTableVersion
+	UnknownTableVersion,
+	InvalidRange,
+	WrappingCoverageIndex
 }
 use FontCorruption::*;
 
@@ -416,7 +418,9 @@ impl<'a> Error for CorruptFont<'a> {
 		OddSegsX2 => "The doubled segment count in the character mapping is not an even number",
 		CmapMissingGuard => "The character mapping is missing a guard value",
 		NoCmap => "No character mapping found",
-		UnknownTableVersion => "The font uses a table version that is not recognised"
+		UnknownTableVersion => "The font uses a table version that is not recognised",
+		InvalidRange => "Invalid index range (last < first) found in font",
+		WrappingCoverageIndex => "Index could wrap in Coverage Range"
 	}}
 }
 impl<'a> ::std::fmt::Display for CorruptFont<'a> {
@@ -680,12 +684,98 @@ impl<'a, T: Indexed> Iterator for IndexList<'a, T> {
 pub struct Lookup;
 impl Indexed for Lookup {}
 
+pub trait LookupContainer<'a>: 'static + Sized {
+	type Lookup;
+	fn new_lookup(data: &'a[u8], lut: LookupList<'a, Self>) -> Result<Self::Lookup, CorruptFont<'a>>;
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct LookupList<'a, T: LookupContainer<'a>>(&'a[u8], PhantomData<&'static T>);
+impl<'a, T: LookupContainer<'a>> LookupList<'a, T> {
+	fn new(data: &'a[u8]) -> Result<LookupList<'a, T>, CorruptFont<'a>> {
+		if data.len() < 2 {return Err(CorruptFont(data, TableTooShort))}
+		let res = LookupList(data, PhantomData);
+		if data.len() < res.len() as usize*2+2 {return Err(CorruptFont(data, TableTooShort))}
+		Ok(res)
+	}
+	fn len(&self) -> u16 {read_u16(self.0).unwrap()}
+	fn get_lookup(self, Index(idx, _): Index<Lookup>) -> Option<Result<T::Lookup, CorruptFont<'a>>> {
+		if idx >= self.len() {return None}
+		let offset = read_u16(&self.0[2+idx as usize*2..]).unwrap();
+		Some(if offset as usize > self.0.len() {
+			Err(CorruptFont(self.0, OffsetOutOfBounds))
+		} else {
+			T::new_lookup(&self.0[offset as usize..], self)
+		})
+	}
+}
+
+fn read_range(range: &[u8]) -> Result<(u16, u16, u16), CorruptFont> {
+	let last = read_u16(&range[2..]).unwrap();
+	let first = read_u16(range).unwrap();
+	if last < first {return Err(CorruptFont(&range[..4], InvalidRange))}
+	let offset = read_u16(&range[4..]).unwrap();
+	if 0xffff-(last-first) < offset {return Err(CorruptFont(range, WrappingCoverageIndex))}
+	Ok((first, last, offset))
+}
+
+pub enum Coverage<'a>{
+	Single(&'a[u8]),
+	Range(&'a[u8])
+}
+impl<'a> Coverage<'a> {
+	fn new(data: &'a[u8]) -> Result<Coverage<'a>, CorruptFont<'a>> {
+		if data.len() < 4 {return Err(CorruptFont(data, TableTooShort))}
+		match read_u16(data).unwrap() {
+			ver @ 1 | ver @ 2 => {
+				let len = read_u16(&data[2..]).unwrap();
+				match ver {
+					1 => if data.len() < len as usize*2 {
+						Err(CorruptFont(data, TableTooShort))
+					} else {
+						Ok(Coverage::Single(&data[4..][..len as usize*2]))
+					},
+					2 => if data.len() < len as usize*6 {
+						Err(CorruptFont(data, TableTooShort))
+					} else {
+						Ok(Coverage::Range(&data[4..][..len as usize*6]))
+					},
+					_ => unreachable!()
+				}
+			},
+			_ => Err(CorruptFont(data, ReservedFeature))
+		}
+	}
+	fn check(&self, GlyphIndex(glyph): GlyphIndex) -> Result<Option<Index<CoveredGlyph>>, CorruptFont<'a>> {
+		let (data, step) = match self {
+			&Coverage::Single(data) => (data, 2),
+			&Coverage::Range(data) => (data, 6)
+		};
+		match AutoSearch::new(data.len()).search(0..(data.len()/step) as u16, &mut move|i|Ok(read_u16(&data[*i as usize*step..]).unwrap().cmp(&glyph))) {
+			Ok(i) => Ok(Some(Index::new(if step == 6 {read_u16(&data[i as usize*6+4..]).unwrap()} else {i}))),
+			Err(Ok(i)) => {
+				let range = &data[i as usize*6..][..6];
+				if step == 2 {return Ok(None)}
+				let (first, last, offset) = try!(read_range(range));
+				Ok(if last >= glyph {
+					Some(Index::new(glyph-first+offset))
+				} else {
+					None
+				})
+			},
+			Err(Err((_, CorruptFont(..)))) => unreachable!()
+		}
+	}
+}
+
+struct CoveredGlyph;
+impl Indexed for CoveredGlyph {}
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub struct GSub<'a> {
 	pub script_list: ScriptList<'a>,
 	pub feature_list: FeatureList<'a>,
-	pub lookup_list: ()
+	pub lookup_list: LookupList<'a, GSubLookups>
 }
 
 impl<'a> GSub<'a> {
@@ -693,15 +783,25 @@ impl<'a> GSub<'a> {
 		if data.len() < 10 {return Err(CorruptFont(data, TableTooShort))}
 		if read_u32(data) != Some(0x00010000) {return Err(CorruptFont(data, UnknownTableVersion))}
 		let scr_off = read_u16(&data[4..]).unwrap() as usize;
-		if data.len() < scr_off + 2 {return Err(CorruptFont(data, TableTooShort))}
 		let feat_off = read_u16(&data[6..]).unwrap() as usize;
+		let lut_off = read_u16(&data[8..]).unwrap() as usize;
+		if data.len() < scr_off || data.len() < feat_off || data.len() < lut_off {return Err(CorruptFont(data, OffsetOutOfBounds))}
 		Ok(GSub {
 			script_list: try!(ScriptList::new(&data[scr_off..])),
-			feature_list: try!(FeatureList::new(&data[scr_off..])),
-			lookup_list: ()
+			feature_list: try!(FeatureList::new(&data[feat_off..])),
+			lookup_list: try!(LookupList::new(&data[lut_off..]))
 		})
 	}
 }
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct GSubLookups;
+impl<'a> LookupContainer<'a> for GSubLookups {
+	type Lookup = GSubLookup<'a>;
+	fn new_lookup(data: &'a[u8], lut: LookupList<'a, GSubLookups>) -> Result<GSubLookup<'a>, CorruptFont<'a>> {unimplemented!()}
+}
+
+pub enum GSubLookup<'a> {Single(Coverage<'a>, u16)}
 
 
 pub struct PositionedGlyph {
