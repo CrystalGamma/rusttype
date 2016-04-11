@@ -479,8 +479,11 @@ impl_strategies!(usize);
 pub enum AutoSearch {Lin, Bin}
 impl AutoSearch {fn new(list_size: usize) -> AutoSearch {if list_size > 4096 {AutoSearch::Bin} else {AutoSearch::Lin}}}
 
-#[derive(Debug)]
-pub struct FeatureIndex(pub u16);
+pub trait Indexed: 'static {}
+
+pub struct Index<T: Indexed>(pub u16, PhantomData<&'static T>);
+impl<T: Indexed> Index<T> {pub fn new(x: u16) -> Index<T> {Index(x, PhantomData)}}
+impl<T: Indexed> std::fmt::Debug for Index<T> {fn fmt(&self, fmt: &mut std::fmt::Formatter) -> Result<(), std::fmt::Error> {self.0.fmt(fmt)}}
 
 pub struct LangSysTable<'a>(&'a[u8]);
 
@@ -493,11 +496,12 @@ impl<'a> LangSysTable<'a> {
 		Ok(LangSysTable(&data[2..num_features as usize*2 + 6]))
 	}
 	pub fn num_features(&self) -> u16 {(self.0.len() / 2 - 2) as u16}
-	pub fn required_feature(&self) -> Option<FeatureIndex> {
+	pub fn required_feature(&self) -> Option<Index<Feature>> {
 		let res = read_u16(self.0).unwrap();
-		if res == 0xffff {None} else {Some(FeatureIndex(res))}
+		if res == 0xffff {None} else {Some(Index::new(res))}
 	}
-	pub fn get_feature(&self, idx: u16) -> Option<FeatureIndex> {read_u16(&self.0[2 + idx as usize*2..]).map(|x| FeatureIndex(x))}
+	pub fn get_feature(&self, idx: u16) -> Option<Index<Feature>> {read_u16(&self.0[4 + idx as usize*2..]).map(|x| Index::new(x))}
+	pub fn features(&self) -> IndexList<'a, Feature> {IndexList(&self.0[4..], PhantomData)}
 }
 
 static DEFAULT_LANGSYS_TABLE: [u8; 4] = [255, 255, 0, 0];
@@ -515,6 +519,7 @@ impl<'a> TagListTable<'a> for LangSys {
 	fn new(data: &'a[u8]) -> Result<Self::Table, CorruptFont<'a>> {LangSysTable::new(data)}
 }
 impl Tagged for LangSys {}
+impl Indexed for LangSys {}
 
 impl<'a> ScriptTable<'a> {
 	pub fn new(data: &'a[u8]) -> Result<ScriptTable<'a>, CorruptFont<'a>> {ScriptTable::new_list(data)}
@@ -539,70 +544,73 @@ impl<'a> ScriptTable<'a> {
 
 use std::marker::PhantomData;
 
-pub trait TagListTable<'a> {
+pub trait TagListTable<'a>: 'static + Indexed + Tagged {
 	type Table;
 	fn bias() -> usize {0}
 	fn new(data: &'a[u8]) -> Result<Self::Table, CorruptFont<'a>>;
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
-pub struct TagOffsetList<'a, Table: TagListTable<'a>>(&'a[u8], PhantomData<Table>);
+pub struct TagOffsetList<'a, Table: TagListTable<'a>>(&'a[u8], PhantomData<&'static Table>);
 
 pub trait Tagged {}
-#[derive(Clone, Copy)]
 pub struct Tag<Table: Tagged>(pub u32, PhantomData<Table>);
 impl<T: Tagged> Tag<T> {pub fn new(v: u32) -> Tag<T> {Tag(v, PhantomData)}}
 
-impl<'a, Table: TagListTable<'a> + Tagged> TagOffsetList<'a, Table> {
+impl<'a, Table: TagListTable<'a>> TagOffsetList<'a, Table> {
 	fn new_list(data: &'a[u8]) -> Result<TagOffsetList<'a, Table>, CorruptFont<'a>> {
 		if data.len() < 2 + Table::bias() {return Err(CorruptFont(data, TableTooShort))}
 		let res = TagOffsetList(data, PhantomData);
 		if data.len() < res.num_tables() as usize*6 + 2 + Table::bias() {return Err(CorruptFont(data, TableTooShort))}
 		Ok(res)
 	}
-	pub fn num_tables(&self) -> u16 {read_u16(&self.0[Table::bias()..]).unwrap()}
-	pub fn tag(&self, idx: u16) -> Option<Tag<Table>> {read_u32(&self.0[idx as usize*6+2+Table::bias()..]).map(|x|Tag(x, PhantomData))}
-	pub fn table(&self, script_index: u16) -> Result<Table::Table, CorruptFont<'a>> {
-		let offset_pos = &self.0[script_index as usize*6 + 6 + Table::bias()..];
+	fn num_tables(&self) -> u16 {read_u16(&self.0[Table::bias()..]).unwrap()}
+	pub fn tag(&self, Index(idx, _): Index<Table>) -> Option<Tag<Table>> {read_u32(&self.0[idx as usize*6+2+Table::bias()..]).map(|x|Tag(x, PhantomData))}
+	pub fn table(&self, Index(index, _): Index<Table>) -> Option<Result<Table::Table, CorruptFont<'a>>> {
+		let offset_pos = &self.0[index as usize*6 + 6 + Table::bias()..];
 		let offset = read_u16(offset_pos).unwrap() as usize;
-		if self.0.len() < offset {return Err(CorruptFont(offset_pos, OffsetOutOfBounds))}
+		if self.0.len() < offset {return None}
 		println!("offset {:x}", offset);
-		Table::new(&self.0[offset..])
+		Some(Table::new(&self.0[offset..]))
 	}
 }
-impl<'a, Table: TagListTable<'a> + Tagged> IntoIterator for TagOffsetList<'a, Table> {
-	type Item = (Tag<Table>, Table::Table);
+impl<'a, Table: TagListTable<'a>> IntoIterator for TagOffsetList<'a, Table> {
+	type Item = (Tag<Table>, Result<Table::Table, CorruptFont<'a>>);
 	type IntoIter = TagOffsetIterator<'a, Table>;
 	fn into_iter(self) -> TagOffsetIterator<'a, Table> {TagOffsetIterator(self, 0, PhantomData)}
 }
 
 #[derive(Clone, Copy)]
 pub struct TagOffsetIterator<'a, Table: TagListTable<'a>>(TagOffsetList<'a, Table>, u16, PhantomData<Table>);
-impl<'a, Table: TagListTable<'a> + Tagged> Iterator for TagOffsetIterator<'a, Table> {
-	type Item = (Tag<Table>, Table::Table);
-	fn next(&mut self) -> Option<(Tag<Table>, Table::Table)> {
+impl<'a, Table: TagListTable<'a>> Iterator for TagOffsetIterator<'a, Table> {
+	type Item = (Tag<Table>, Result<Table::Table, CorruptFont<'a>>);
+	fn next(&mut self) -> Option<<Self as Iterator>::Item> {
 		if self.1 >= self.0.num_tables() {
 			None
 		} else {
 			self.1 += 1;
-			Some((self.0.tag(self.1 - 1).unwrap(), self.0.table(self.1 - 1).unwrap()))
+			Some((self.0.tag(Index::new(self.1 - 1)).unwrap(), self.0.table(Index::new(self.1 - 1)).unwrap()))
 		}
 	}
+	fn size_hint(&self) -> (usize, Option<usize>) {let res = self.0.num_tables() as usize; (res, Some(res))}
 }
+impl<'a, T: TagListTable<'a> + Tagged> ExactSizeIterator for TagOffsetIterator<'a, T> {}
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub struct Script;
 pub type ScriptList<'a> = TagOffsetList<'a, Script>;
 impl<'a> TagListTable<'a> for Script {type Table = ScriptTable<'a>; fn new(data: &'a[u8]) -> Result<Self::Table, CorruptFont<'a>> {ScriptTable::new(data)}}
 impl Tagged for Script {}
+impl Indexed for Script {}
+
 impl<'a> ScriptList<'a> {
 	pub fn new(data: &'a[u8]) -> Result<ScriptList<'a>, CorruptFont<'a>> {ScriptList::new_list(data)}
 	pub fn features_for(&self, selector: Option<(Tag<Script>, Option<Tag<LangSys>>)>) -> Result<LangSysTable<'a>, CorruptFont<'a>> {
 		let search = AutoSearch::new(self.num_tables() as usize*6);
 		if let Some((script, lang_sys_opt)) = selector {
-			match search.search(0..self.num_tables(), &mut move|&i| Ok(self.tag(i).unwrap().0.cmp(&script.0))) {
+			match search.search(0..self.num_tables(), &mut move|&i| Ok(self.tag(Index::new(i)).unwrap().0.cmp(&script.0))) {
 				Ok(idx) => {
-					let script_table = try!(self.table(idx));
+					let script_table = try!(self.table(Index::new(idx)).unwrap());
 					if let Some(lang_sys) = lang_sys_opt {
 						unimplemented!()
 					} else {
@@ -613,9 +621,9 @@ impl<'a> ScriptList<'a> {
 				Err(Err((_, e))) => return Err(e)
 			}
 		}
-		match search.search(0..self.num_tables(), &mut move|&i| Ok(self.tag(i).unwrap().0.cmp(&DFLT_TAG.0))) {
+		match search.search(0..self.num_tables(), &mut move|&i| Ok(self.tag(Index::new(i)).unwrap().0.cmp(&DFLT_TAG.0))) {
 			Ok(i) => {
-				let script_table = try!(self.table(i));
+				let script_table = try!(self.table(Index::new(i)).unwrap());
 				try!(script_table.validate_dflt());
 				script_table.default_lang_sys()
 			},
@@ -625,13 +633,18 @@ impl<'a> ScriptList<'a> {
 	}
 }
 
+static DFLT_TAG: Tag<Script> = Tag(0x44464c54, PhantomData);
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub struct Feature;
 pub type FeatureList<'a> = TagOffsetList<'a, Feature>;
 impl<'a> TagListTable<'a> for Feature {type Table = FeatureTable<'a>; fn new(data: &'a[u8]) -> Result<Self::Table, CorruptFont<'a>> {FeatureTable::new(data)}}
 impl Tagged for Feature {}
+impl Indexed for Feature {}
 
-impl<'a> FeatureList<'a> {fn new(data: &'a[u8]) -> Result<FeatureList<'a>, CorruptFont<'a>> {FeatureList::new_list(data)}}
+impl<'a> FeatureList<'a> {
+	fn new(data: &'a[u8]) -> Result<FeatureList<'a>, CorruptFont<'a>> {FeatureList::new_list(data)}
+}
 
 pub struct FeatureTable<'a>(&'a[u8]);
 impl<'a> FeatureTable<'a> {
@@ -642,9 +655,30 @@ impl<'a> FeatureTable<'a> {
 		if len as usize*2+4 > data.len() {return Err(CorruptFont(data, TableTooShort))}
 		Ok(FeatureTable(&data[4..len as usize*2+4]))
 	}
+	fn lookups(&self) -> IndexList<'a, Lookup> {IndexList(&self.0[4..], PhantomData)}
 }
 
-static DFLT_TAG: Tag<Script> = Tag(0x44464c54, PhantomData);
+pub struct IndexList<'a, T: Indexed>(&'a[u8], PhantomData<&'static T>);
+impl<'a, T: Indexed> IndexList<'a, T> {
+	pub fn len(&self) -> usize {self.0.len()/2}
+}
+impl<'a, T: Indexed> ExactSizeIterator for IndexList<'a, T> {}
+impl<'a, T: Indexed> Iterator for IndexList<'a, T> {
+	type Item = Index<T>;
+	fn next(&mut self) -> Option<Index<T>> {
+		if self.0.len() < 2 {
+			None
+		} else {
+			let res = read_u16(self.0).unwrap();
+			self.0 = &self.0[2..];
+			Some(Index::new(res))
+		}
+	}
+	fn size_hint(&self) -> (usize, Option<usize>) {(self.len(), Some(self.len()))}
+}
+
+pub struct Lookup;
+impl Indexed for Lookup {}
 
 
 #[derive(Clone, Copy, PartialEq, Eq)]
