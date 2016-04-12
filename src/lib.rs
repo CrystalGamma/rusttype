@@ -803,6 +803,14 @@ impl<'a> LookupContainer<'a> for GSubLookups {
 
 pub enum GSubLookup<'a> {Single(Coverage<'a>, u16)}
 
+pub struct BasicGlyphMapper(Vec<(usize, usize)>);
+
+impl GlyphMapper for BasicGlyphMapper {
+	fn new() -> BasicGlyphMapper {BasicGlyphMapper(Vec::new())}
+	fn map_char_to_glyph(&self, char_idx: usize, pos: Fractional) -> Option<(usize, Fractional)> {unimplemented!()}
+	fn map_glyph_to_char(&self, glyph_idx: usize, pos: Fractional) -> Option<(usize, Fractional)> {unimplemented!()}
+}
+
 
 pub struct PositionedGlyph {
 	glyph: GlyphIndex,
