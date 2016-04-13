@@ -36,16 +36,8 @@ impl ItemTypesetting {
 	}
 }
 
-/// ISO 15924 alphabetical code
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct ScriptCode([u8; 4]);
-
-pub static LATIN: ScriptCode = ScriptCode(['L' as u8, 'a' as u8, 't' as u8, 'n' as u8]);	// "Latn"
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MainAxis {Ltr, Rtl, Ttb, Btt}
-
-pub struct NonNativeConf;
 
 pub struct Run<'a>(pub &'a str, pub ScriptCode);
 
@@ -65,8 +57,6 @@ pub fn make_default_streak<'a>(run: &'a Run, main_axis: MainAxis) -> Item<'a> {
 	}
 }
 
-pub fn make_runs(s: &str) -> Vec<Run> {vec![Run(s, LATIN)]}
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Item<'text>{
 	pub text: &'text str,
@@ -80,11 +70,6 @@ impl<'a> Item<'a> {
 }
 
 pub fn bidi_algorithm(streaks: &mut [Item]) {}
-
-pub struct FontPreference<'a>(Font<'a>);
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct FWord(i16);
 
 macro_rules! try_opt {
 	($e:expr) => (match $e {Some(x)=>x, None=>return None})
@@ -130,9 +115,6 @@ impl<'a> TableDirectory<'a> {
 		None
 	}
 }
-
-/// what features of the font collection do we want to use?
-pub struct FontConfiguration;
 
 /// contains character mapping
 #[derive(PartialEq, Clone, Copy)]
