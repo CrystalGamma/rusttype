@@ -39,38 +39,6 @@ impl ItemTypesetting {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MainAxis {Ltr, Rtl, Ttb, Btt}
 
-pub struct Run<'a>(pub &'a str, pub ScriptCode);
-
-pub fn make_default_streak<'a>(run: &'a Run, main_axis: MainAxis) -> Item<'a> {
-	use self::MainAxis::*;
-	Item {
-		text: run.0,
-		script: run.1,
-		dir: ItemTypesetting(DirBehavior(Forward, Perpendicular), if run.1 == LATIN {
-			match main_axis {
-				Ltr | Ttb => Rot180::Normal,
-				Rtl | Btt => Rot180::Rotated
-			}
-		} else {
-			unimplemented!();
-		})
-	}
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Item<'text>{
-	pub text: &'text str,
-	pub script: ScriptCode,
-	pub dir: ItemTypesetting
-}
-
-impl<'a> Item<'a> {
-	/// what order do the parts have if you split the streak
-	pub fn direction(&self) -> Direction {self.dir.effective_direction()}
-}
-
-pub fn bidi_algorithm(streaks: &mut [Item]) {}
-
 macro_rules! try_opt {
 	($e:expr) => (match $e {Some(x)=>x, None=>return None})
 }
@@ -791,6 +759,11 @@ impl GlyphMapper for BasicGlyphMapper {
 	fn new() -> BasicGlyphMapper {BasicGlyphMapper(Vec::new())}
 	fn map_char_to_glyph(&self, char_idx: usize, pos: Fractional) -> Option<(usize, Fractional)> {unimplemented!()}
 	fn map_glyph_to_char(&self, glyph_idx: usize, pos: Fractional) -> Option<(usize, Fractional)> {unimplemented!()}
+}
+
+impl<'a> MonotonicSubstitution for GSubLookup<'a> {
+	type GlyphMapper = BasicGlyphMapper;
+	fn substitute_mutate(&self, forward: &mut Vec<GlyphIndex>, backward: &mut Vec<GlyphIndex>, map_fwd: &mut Self::GlyphMapper, map_bwd: &mut Self::GlyphMapper) -> Option<usize> {unimplemented!()}
 }
 
 
