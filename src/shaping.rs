@@ -11,7 +11,6 @@ impl Shaper for BasicShaper {
 		let (mut chars, mut clusters) = (Vec::with_capacity(text.len()/MAX_UTF8_LEN), Vec::with_capacity(text.len()/MAX_UTF8_LEN));
 		for (i, c) in text.char_indices() {
 			chars.push(try_opt!(lookup(c)));
-			let last_cluster = clusters.last().cloned().unwrap_or((0, 0));
 			let char_size = c.len_utf8();
 			if char_size > 1 {
 				clusters.push((chars.len(), i+char_size));
